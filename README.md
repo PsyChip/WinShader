@@ -2,10 +2,13 @@
 
 # <div align="center">AVS Shader Screensaver</div>
 
+<<<<<<< HEAD
 <div align="center">
 <h3>A portable OpenGL screensaver for Windows that randomly picks from <b>43 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
 </div>
 
+=======
+>>>>>>> 7cc1bd1b945bdd38200d38c4272dba10087ddbbd
 ---
 
 ## Features
