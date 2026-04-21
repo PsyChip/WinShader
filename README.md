@@ -1,9 +1,10 @@
-# AVS Shader Screensaver
+![Screenshot](Screenshot%202026-04-21.png)
 
-A portable OpenGL screensaver for Windows that randomly picks from **43 curated GLSL fragment shaders** embedded directly in the executable. No external files needed — a single `.exe` (or `.scr`) contains everything.
+# <div align="center">AVS Shader Screensaver</div>
 
-Curated by **PsyChip** — root@psychip.net — April 2026  
-https://www.psychip.net
+<div align="center">
+<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>43 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
+</div>
 
 ---
 
@@ -128,3 +129,11 @@ Remaining shaders are twigl.app conversions, Shadertoy ports, or original compos
 The host code (`shader.cpp`, `build.bat`, `sign.bat`) is released under MIT license.  
 Individual GLSL shaders retain their original licenses as noted above. Most are CC BY-NC-SA 3.0.  
 The icon (`commodorevic20.ico`) is included for personal/non-commercial use.
+
+---
+
+Curated by **PsyChip**
+root@psychip.net
+https://psychip.net
+April 2026  
+
