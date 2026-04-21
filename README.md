@@ -1,14 +1,12 @@
 ![Screenshot](Screenshot%202026-04-21.png)
 
-# <div align="center">AVS Shader Screensaver</div>
+# <div align="center">WinShader</div>
 
-<<<<<<< HEAD
 <div align="center">
-<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>43 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
+<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>43 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.scr</code> contains everything.</h3>
 </div>
 
 =======
->>>>>>> 7cc1bd1b945bdd38200d38c4272dba10087ddbbd
 ---
 
 ## Features
@@ -19,12 +17,9 @@
 - **Dead-zone culling** — automatically detects mismatched monitor layouts (different resolutions/orientations) and injects per-pixel monitor bounds checking into every shader at runtime. Pixels in the gaps between monitors are skipped via early-return, saving GPU cycles on non-rectangular multi-monitor setups
 - **Real-time clock** — shaders that use `iDate` receive actual system time via `GetLocalTime()`. When a shader has its own clock display, the built-in GDI overlay clock is automatically hidden
 - **GDI clock overlay** — Segoe UI time/date display with drop shadow, anchored to primary monitor bottom-left. Disabled when the active shader provides its own clock
-- **Screensaver compatible** — handles `/s`, `/p`, `/c`, `/a` command-line flags. Rename to `.scr` and install via right-click or copy to `System32`
 - **Single instance** — mutex with 3-second timeout prevents multiple copies from running
 - **GPU-friendly optimizations** — many shaders include scanline skip (50% pixel reduction), reduced iteration counts, and early-exit patterns
-- **Shadertoy uniform compatibility** — supports `time`/`resolution`/`mouse` and `iTime`/`iResolution`/`iMouse`/`iTimeDelta`/`iFrame`/`iDate` uniforms
 - **VSync enabled** via `wglSwapIntervalEXT`
-- **GLSL injection** — monitor culling code is transparently injected into shader source at load time by renaming `main()` and wrapping it. No per-shader modification needed
 
 ## Usage
 
@@ -44,7 +39,7 @@ shader.exe terrain.glsl       # Run a specific shader from disk
 
 ### Requirements
 
-- **MSVC** (Visual Studio Build Tools or full Visual Studio)
+- **MSVC 2022** (Visual Studio Build Tools or full Visual Studio)
 - **Windows SDK** (for `rc.exe` resource compiler)
 - No external libraries — uses only `user32`, `gdi32`, `opengl32`, `kernel32`
 
