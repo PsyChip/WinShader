@@ -705,31 +705,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     // ---------------------------------------------------------------------------
     // Screensaver mode handling
+    // Windows spawns many /p (preview) and /c (config) instances — exit immediately
+    // for any flag except /s (run) and /lock (our custom flag).
     // ---------------------------------------------------------------------------
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (*a == '/' || *a == '-') a++;
         char ch = a[0] | 0x20; // lowercase
-        // /c — config, /a — password (obsolete): exit immediately
-        if ((ch == 'c' || ch == 'a') && a[1] == '\0') return 0;
         // /lock — lock workstation when shader is dismissed
-        if (ch == 'l' && (a[1] | 0x20) == 'o') g_lockOnExit = true;
-        // /p HWND — preview: create a child window that stays alive (black)
-        if (ch == 'p' && a[1] == '\0' && i + 1 < argc) {
-            LONG_PTR hwndVal = 0;
-            for (const char* c = argv[i + 1]; *c >= '0' && *c <= '9'; c++)
-                hwndVal = hwndVal * 10 + (*c - '0');
-            HWND parent = (HWND)hwndVal;
-            if (parent) {
-                // Idle message loop — keeps preview alive until parent closes
-                MSG msg;
-                while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-            return 0;
-        }
+        if (ch == 'l' && (a[1] | 0x20) == 'o') { g_lockOnExit = true; continue; }
+        // /s — run the screensaver (standard Windows flag): allow
+        if (ch == 's' && a[1] == '\0') continue;
+        // Everything else (/p, /c, /a, unknown flags): exit immediately
+        return 0;
     }
 
     // ---------------------------------------------------------------------------

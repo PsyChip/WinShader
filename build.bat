@@ -20,13 +20,13 @@ echo   BEGIN
 echo     BLOCK "040904b0"
 echo     BEGIN
 echo       VALUE "CompanyName", "PsyChip"
-echo       VALUE "FileDescription", "Random screensavers from over 40+ curated GLSL shaders"
-echo       VALUE "FileVersion", "1.0.0.0"
+echo       VALUE "FileDescription", "GLSL shader screensaver"
+echo       VALUE "FileVersion", "1.2.0.0"
 echo       VALUE "InternalName", "shader"
-echo       VALUE "LegalCopyright", "Curated by PsyChip - root@psychip.net - April 2026 - www.psychip.net"
+echo       VALUE "LegalCopyright", "psychip.net"
 echo       VALUE "OriginalFilename", "shader.scr"
-echo       VALUE "ProductName", "AVS Shader Screensaver"
-echo       VALUE "ProductVersion", "1.0.0.0"
+echo       VALUE "ProductName", "GLSL shader screensaver"
+echo       VALUE "ProductVersion", "1.2.0.0"
 echo     END
 echo   END
 echo   BLOCK "VarFileInfo"
@@ -48,6 +48,7 @@ cl /O1 /GS- /GF shader.cpp shaders.res /link /OPT:REF /OPT:ICF user32.lib gdi32.
 
 del *.obj 2>nul
 del shaders.res 2>nul
+del shaders.rc 2>nul
 
 REM Copy as screensaver
 copy /y shader.exe shader.scr >nul 2>nul
