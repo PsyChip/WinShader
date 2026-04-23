@@ -2,25 +2,22 @@
 
 # <div align="center">AVS Shader Screensaver</div>
 
-<<<<<<< HEAD
 <div align="center">
-<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>43 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
+<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>46 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
 </div>
 
-=======
->>>>>>> 7cc1bd1b945bdd38200d38c4272dba10087ddbbd
 ---
 
 ## Features
 
-- **43 embedded GLSL shaders** — fractals, terrain, aurora, oceans, fire, clocks, cyberpunk cityscapes, glass refraction, fireworks and more
+- **46 embedded GLSL shaders** — fractals, terrain, aurora, oceans, fire, clocks, cyberpunk cityscapes, glass refraction, fireworks and more
 - **Fully portable** — all shaders are bundled as PE resources inside the executable. Copy it anywhere and run
 - **Multi-monitor support** — renders across all monitors using the virtual screen dimensions
 - **Dead-zone culling** — automatically detects mismatched monitor layouts (different resolutions/orientations) and injects per-pixel monitor bounds checking into every shader at runtime. Pixels in the gaps between monitors are skipped via early-return, saving GPU cycles on non-rectangular multi-monitor setups
 - **Real-time clock** — shaders that use `iDate` receive actual system time via `GetLocalTime()`. When a shader has its own clock display, the built-in GDI overlay clock is automatically hidden
 - **GDI clock overlay** — Segoe UI time/date display with drop shadow, anchored to primary monitor bottom-left. Disabled when the active shader provides its own clock
 - **Screensaver compatible** — handles `/s`, `/p`, `/c`, `/a` command-line flags. Rename to `.scr` and install via right-click or copy to `System32`
-- **Single instance** — mutex with 3-second timeout prevents multiple copies from running
+- **Single instance** — mutex with 3-second timeout prevents multiple copies from running. Mutex is released before `LockWorkStation()` to avoid stalling the next instance on exit
 - **GPU-friendly optimizations** — many shaders include scanline skip (50% pixel reduction), reduced iteration counts, and early-exit patterns
 - **Shadertoy uniform compatibility** — supports `time`/`resolution`/`mouse` and `iTime`/`iResolution`/`iMouse`/`iTimeDelta`/`iFrame`/`iDate` uniforms
 - **VSync enabled** via `wglSwapIntervalEXT`
@@ -135,8 +132,6 @@ The icon (`commodorevic20.ico`) is included for personal/non-commercial use.
 
 ---
 
-Curated by **PsyChip**
-root@psychip.net
-https://psychip.net
+**psychip.net**
 April 2026  
 

@@ -65,6 +65,8 @@ static int   g_w = 1, g_h = 1;
 static DWORD g_startMs = 0;
 static float g_mx = 0.5f, g_my = 0.5f;
 static bool  g_shaderHasClock = false; // true if shader uses iDate (has its own clock)
+static bool  g_lockOnExit = false;     // lock workstation when shader is dismissed
+static HANDLE g_hMutex = nullptr;      // single-instance mutex
 
 // ---------------------------------------------------------------------------
 // Monitor dead-zone culling
@@ -462,39 +464,106 @@ static void Render()
 
 static HWND g_clockWnd = nullptr;
 
+// Persistent clock GDI resources — created once, reused every tick
+static const int CW = 600, CH = 170;
+static HDC   g_clockScreenDC = nullptr;
+static HDC   g_clockMemDC    = nullptr;
+static HDC   g_clockTmpDC    = nullptr;
+static HBITMAP g_clockBmp    = nullptr;
+static HBITMAP g_clockTmpBmp = nullptr;
+static HBITMAP g_clockOldBmp = nullptr;
+static HBITMAP g_clockTmpOld = nullptr;
+static DWORD*  g_clockBits   = nullptr;
+static DWORD*  g_clockTmpBits= nullptr;
+static HFONT   g_clockTimeFont = nullptr;
+static HFONT   g_clockDateFont = nullptr;
+
+static void InitClockGDI()
+{
+    g_clockScreenDC = GetDC(nullptr);
+    g_clockMemDC    = CreateCompatibleDC(g_clockScreenDC);
+    g_clockTmpDC    = CreateCompatibleDC(g_clockScreenDC);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = CW;
+    bmi.bmiHeader.biHeight      = -CH;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    g_clockBmp    = CreateDIBSection(g_clockMemDC, &bmi, DIB_RGB_COLORS, (void**)&g_clockBits, nullptr, 0);
+    g_clockTmpBmp = CreateDIBSection(g_clockTmpDC, &bmi, DIB_RGB_COLORS, (void**)&g_clockTmpBits, nullptr, 0);
+    g_clockOldBmp = (HBITMAP)SelectObject(g_clockMemDC, g_clockBmp);
+    g_clockTmpOld = (HBITMAP)SelectObject(g_clockTmpDC, g_clockTmpBmp);
+
+    SetBkMode(g_clockTmpDC, TRANSPARENT);
+    SetTextColor(g_clockTmpDC, RGB(255, 255, 255));
+
+    g_clockTimeFont = CreateFontW(100, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_clockDateFont = CreateFontW(36, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+static void FreeClockGDI()
+{
+    if (g_clockTimeFont) { DeleteObject(g_clockTimeFont); g_clockTimeFont = nullptr; }
+    if (g_clockDateFont) { DeleteObject(g_clockDateFont); g_clockDateFont = nullptr; }
+    if (g_clockTmpDC)    { SelectObject(g_clockTmpDC, g_clockTmpOld); DeleteDC(g_clockTmpDC); g_clockTmpDC = nullptr; }
+    if (g_clockTmpBmp)   { DeleteObject(g_clockTmpBmp); g_clockTmpBmp = nullptr; }
+    if (g_clockMemDC)    { SelectObject(g_clockMemDC, g_clockOldBmp); DeleteDC(g_clockMemDC); g_clockMemDC = nullptr; }
+    if (g_clockBmp)      { DeleteObject(g_clockBmp); g_clockBmp = nullptr; }
+    if (g_clockScreenDC) { ReleaseDC(nullptr, g_clockScreenDC); g_clockScreenDC = nullptr; }
+}
+
+static void ClockDrawText(const wchar_t* text, HFONT font, int x, int y, DWORD argb)
+{
+    for (int i = 0; i < CW * CH; ++i) g_clockTmpBits[i] = 0;
+    SelectObject(g_clockTmpDC, font);
+    RECT rc = {0, 0, CW, CH};
+    ExtTextOutW(g_clockTmpDC, 0, 0, 0, &rc, text, lstrlenW(text), nullptr);
+
+    BYTE ar = (argb >> 24) & 0xFF, rr = (argb >> 16) & 0xFF;
+    BYTE gr = (argb >> 8) & 0xFF, br = argb & 0xFF;
+
+    for (int py = 0; py < CH; ++py) {
+        for (int px = 0; px < CW; ++px) {
+            BYTE cov = (BYTE)(g_clockTmpBits[py * CW + px] & 0xFF);
+            if (cov == 0) continue;
+            int dx = x + px, dy = y + py;
+            if (dx < 0 || dx >= CW || dy < 0 || dy >= CH) continue;
+            BYTE a = (BYTE)((ar * cov) / 255);
+            DWORD& dst = g_clockBits[dy * CW + dx];
+            BYTE inv = 255 - a;
+            BYTE da = (dst >> 24) & 0xFF;
+            dst = (((DWORD)(a + (da * inv) / 255)) << 24) |
+                  (((DWORD)((rr * a + ((dst >> 16 & 0xFF) * inv)) / 255)) << 16) |
+                  (((DWORD)((gr * a + ((dst >> 8 & 0xFF) * inv)) / 255)) << 8) |
+                  ((DWORD)((br * a + ((dst & 0xFF) * inv)) / 255));
+        }
+    }
+}
+
 static void DrawClock(HWND hwnd)
 {
-    // Primary monitor bottom-left anchor
+    if (!g_clockMemDC) InitClockGDI();
+
     MONITORINFO mi = {};
     mi.cbSize = sizeof(mi);
     POINT origin = {0, 0};
     GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi);
     RECT mon = mi.rcMonitor;
 
-    const int W = 600, H = 170;
     const int PAD = 36;
-    int winX = mon.left   + PAD;
-    int winY = mon.bottom - H - PAD;
+    int winX = mon.left + PAD;
+    int winY = mon.bottom - CH - PAD;
 
-    // 32-bit DIB for per-pixel alpha (UpdateLayeredWindow requirement)
-    HDC screenDC = GetDC(nullptr);
-    HDC memDC    = CreateCompatibleDC(screenDC);
+    // Clear
+    for (int i = 0; i < CW * CH; ++i) g_clockBits[i] = 0;
 
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = W;
-    bmi.bmiHeader.biHeight      = -H;
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    DWORD* bits = nullptr;
-    HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    HBITMAP hOld = (HBITMAP)SelectObject(memDC, hBmp);
-
-    // Clear to transparent
-    for (int i = 0; i < W * H; ++i) bits[i] = 0;
-
-    // Get time & date strings
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t timeBuf[16];
@@ -504,92 +573,21 @@ static void DrawClock(HWND hwnd)
     GetDateFormatW(LOCALE_USER_DEFAULT, 0, &st, L"MMM d", monthDay, 64);
     wsprintfW(dateBuf, L"%s, %s", monthDay, dayName);
 
-    // Helper: draw text into the DIB at (x,y) with given colour, pre-multiplied alpha
-    // We use a temporary scratch DC + monochrome mask to composite each glyph
-    auto DrawText_ = [&](const wchar_t* text, HFONT font, int x, int y, DWORD argb)
-    {
-        // Render text to a scratch 32bpp DIB to read glyph coverage
-        HDC tmpDC = CreateCompatibleDC(screenDC);
-        DWORD* tmpBits = nullptr;
-        HBITMAP tmpBmp = CreateDIBSection(tmpDC, &bmi, DIB_RGB_COLORS, (void**)&tmpBits, nullptr, 0);
-        HBITMAP tmpOld = (HBITMAP)SelectObject(tmpDC, tmpBmp);
-        for (int i = 0; i < W * H; ++i) tmpBits[i] = 0;
+    ClockDrawText(timeBuf, g_clockTimeFont, 4, 4, 0x99000000);
+    ClockDrawText(timeBuf, g_clockTimeFont, 0, 0, 0xFFFFFFFF);
+    ClockDrawText(dateBuf, g_clockDateFont, 4, 98, 0x99000000);
+    ClockDrawText(dateBuf, g_clockDateFont, 2, 96, 0xFFFFFFFF);
 
-        SelectObject(tmpDC, font);
-        SetBkMode(tmpDC, TRANSPARENT);
-        SetTextColor(tmpDC, RGB(255, 255, 255));
-        RECT rc = {0, 0, W, H};
-        ExtTextOutW(tmpDC, 0, 0, 0, &rc, text, lstrlenW(text), nullptr);
-
-        BYTE ar = (argb >> 24) & 0xFF;
-        BYTE rr = (argb >> 16) & 0xFF;
-        BYTE gr = (argb >>  8) & 0xFF;
-        BYTE br = (argb      ) & 0xFF;
-
-        // Composite: for each pixel, use the red channel as coverage
-        int ox = x, oy = y;
-        for (int py = 0; py < H; ++py) {
-            for (int px = 0; px < W; ++px) {
-                DWORD src = tmpBits[py * W + px];
-                BYTE cov = (BYTE)(src & 0xFF); // R channel = coverage
-                if (cov == 0) continue;
-                int dx = ox + px, dy = oy + py;
-                if (dx < 0 || dx >= W || dy < 0 || dy >= H) continue;
-                BYTE a = (BYTE)((ar * cov) / 255);
-                // Pre-multiplied alpha blend over existing pixel
-                DWORD& dst = bits[dy * W + dx];
-                BYTE da = (dst >> 24) & 0xFF;
-                BYTE inv = 255 - a;
-                BYTE outA = a + (BYTE)((da * inv) / 255);
-                BYTE outR = (BYTE)((rr * a + ((dst >> 16 & 0xFF) * inv)) / 255);
-                BYTE outG = (BYTE)((gr * a + ((dst >>  8 & 0xFF) * inv)) / 255);
-                BYTE outB = (BYTE)((br * a + ((dst       & 0xFF) * inv)) / 255);
-                dst = ((DWORD)outA << 24) | ((DWORD)outR << 16) | ((DWORD)outG << 8) | outB;
-            }
-        }
-
-        SelectObject(tmpDC, tmpOld);
-        DeleteObject(tmpBmp);
-        DeleteDC(tmpDC);
-    };
-
-    // Create fonts — Segoe UI bold for time, regular for date
-    HFONT timeFont = CreateFontW(
-        100, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
-    HFONT dateFont = CreateFontW(
-        36, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
-
-    // Shadow (semi-transparent black), then white text
-    DrawText_(timeBuf, timeFont,  4,  4, 0x99000000); // shadow
-    DrawText_(timeBuf, timeFont,  0,  0, 0xFFFFFFFF); // time
-    DrawText_(dateBuf, dateFont,  4, 98, 0x99000000); // shadow
-    DrawText_(dateBuf, dateFont,  2, 96, 0xFFFFFFFF); // date
-
-    DeleteObject(timeFont);
-    DeleteObject(dateFont);
-
-    // Push to layered window
     POINT ptSrc = {0, 0};
-    SIZE  szWnd = {W, H};
+    SIZE  szWnd = {CW, CH};
     POINT ptDst = {winX, winY};
     BLENDFUNCTION bf = {};
     bf.BlendOp             = AC_SRC_OVER;
     bf.SourceConstantAlpha = 255;
     bf.AlphaFormat         = AC_SRC_ALPHA;
 
-    SetWindowPos(hwnd, nullptr, winX, winY, W, H, SWP_NOZORDER | SWP_NOACTIVATE);
-    UpdateLayeredWindow(hwnd, screenDC, &ptDst, &szWnd, memDC, &ptSrc, 0, &bf, ULW_ALPHA);
-
-    SelectObject(memDC, hOld);
-    DeleteObject(hBmp);
-    DeleteDC(memDC);
-    ReleaseDC(nullptr, screenDC);
+    SetWindowPos(hwnd, nullptr, winX, winY, CW, CH, SWP_NOZORDER | SWP_NOACTIVATE);
+    UpdateLayeredWindow(hwnd, g_clockScreenDC, &ptDst, &szWnd, g_clockMemDC, &ptSrc, 0, &bf, ULW_ALPHA);
 }
 
 LRESULT CALLBACK ClockWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -666,6 +664,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         if (g_hglrc) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(g_hglrc); }
+        if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = nullptr; }
+        if (g_lockOnExit) LockWorkStation();
         PostQuitMessage(0);
         return 0;
     }
@@ -704,24 +704,43 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // argv[0] = exe, argv[1..] = user args
 
     // ---------------------------------------------------------------------------
-    // Quick exit for screensaver config/password/preview — halt immediately
+    // Screensaver mode handling
     // ---------------------------------------------------------------------------
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (*a == '/' || *a == '-') a++;
         char ch = a[0] | 0x20; // lowercase
+        // /c — config, /a — password (obsolete): exit immediately
         if ((ch == 'c' || ch == 'a') && a[1] == '\0') return 0;
-        if (ch == 'p' && a[1] == '\0') return 0; // preview — exit immediately
+        // /lock — lock workstation when shader is dismissed
+        if (ch == 'l' && (a[1] | 0x20) == 'o') g_lockOnExit = true;
+        // /p HWND — preview: create a child window that stays alive (black)
+        if (ch == 'p' && a[1] == '\0' && i + 1 < argc) {
+            LONG_PTR hwndVal = 0;
+            for (const char* c = argv[i + 1]; *c >= '0' && *c <= '9'; c++)
+                hwndVal = hwndVal * 10 + (*c - '0');
+            HWND parent = (HWND)hwndVal;
+            if (parent) {
+                // Idle message loop — keeps preview alive until parent closes
+                MSG msg;
+                while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            return 0;
+        }
     }
 
     // ---------------------------------------------------------------------------
     // Single instance mutex — wait up to 3 seconds, then bail
     // ---------------------------------------------------------------------------
-    HANDLE hMutex = CreateMutexA(nullptr, FALSE, "Global\\AVS_Shader_Screensaver_Mutex");
-    if (hMutex) {
-        DWORD waitResult = WaitForSingleObject(hMutex, 3000);
+    g_hMutex = CreateMutexA(nullptr, FALSE, "Global\\AVS_Shader_Screensaver_Mutex");
+    if (g_hMutex) {
+        DWORD waitResult = WaitForSingleObject(g_hMutex, 3000);
         if (waitResult == WAIT_TIMEOUT || waitResult == WAIT_FAILED) {
-            CloseHandle(hMutex);
+            CloseHandle(g_hMutex);
+            g_hMutex = nullptr;
             return 0; // another instance is running
         }
     }
@@ -795,6 +814,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     if (!g_shaderHasClock) CreateClockWindow(hInst, hwnd);
 
+    // Move mouse to bottom of screen
+    SetCursorPos(vx + vw / 2, vy + vh - 1);
+
     // Active render loop — render every frame, dispatch queued messages
     MSG msg = {};
     for (;;) {
@@ -806,7 +828,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         Render();
     }
 done:
+    FreeClockGDI();
     if (g_clockWnd) { DestroyWindow(g_clockWnd); g_clockWnd = nullptr; }
-    if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
+    if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = nullptr; }
     return (int)msg.wParam;
 }
