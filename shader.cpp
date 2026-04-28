@@ -75,16 +75,24 @@ static HANDLE g_hMutex = nullptr;      // single-instance mutex
 static RECT  g_monRects[MAX_MONITORS];  // Windows coords (top-left origin)
 static int   g_monCount = 0;
 static bool  g_needsCulling = false;     // true if monitors differ in size/position
+static bool  g_primaryOnly = false;      // true if shader uses iDate → confine to primary monitor
+static RECT  g_primaryRect = {};         // primary monitor rect (Windows coords)
 static GLint g_uMonCount = -1;
 static GLint g_uMonRects = -1;
+static GLint g_uPrimRect = -1;
 
 // GL-space monitor rects: vec4(xMin, yMin, xMax, yMax) with Y=0 at bottom
 static float g_monGL[MAX_MONITORS * 4];
+static float g_primGL[4];               // primary monitor rect in GL coords
 
-static BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT rc, LPARAM)
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT rc, LPARAM)
 {
     if (g_monCount < MAX_MONITORS)
         g_monRects[g_monCount++] = *rc;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi) && (mi.dwFlags & MONITORINFOF_PRIMARY))
+        g_primaryRect = mi.rcMonitor;
     return TRUE;
 }
 
@@ -124,12 +132,24 @@ static void BuildMonitorGLRects(int vx, int vy, int vw, int vh)
         g_monGL[i * 4 + 2] = xMax;
         g_monGL[i * 4 + 3] = yMax;
     }
+
+    g_primGL[0] = (float)(g_primaryRect.left  - vx);
+    g_primGL[2] = (float)(g_primaryRect.right - vx);
+    g_primGL[1] = (float)(vh - (g_primaryRect.bottom - vy));
+    g_primGL[3] = (float)(vh - (g_primaryRect.top    - vy));
 }
 
 // GLSL prefix: declares uniforms and early-returns if pixel is outside all monitors
 static const char* kCullPrefix = R"(
 uniform int   _monCount;
 uniform vec4  _monRects[8];
+)";
+
+// GLSL prefix for primary-only mode (shaders that use iDate, e.g. clocks).
+// Remaps gl_FragCoord into primary-monitor-local space; pixels outside are blacked out at main entry.
+static const char* kPrimPrefix = R"(
+uniform vec4 _primRect;
+#define gl_FragCoord (gl_FragCoord - vec4(_primRect.xy, 0.0, 0.0))
 )";
 
 // Cached uniform locations (set once after link, -1 = not present)
@@ -179,6 +199,7 @@ static int      g_resCount = 0;
 static BOOL CALLBACK EnumResNameProc(HMODULE hMod, LPCSTR type, LPSTR name, LONG_PTR lParam)
 {
     if (g_resCount >= 256) return FALSE;
+    if (IS_INTRESOURCE(name)) return TRUE;
     HRSRC hr = FindResourceA(hMod, name, type);
     if (!hr) return TRUE;
     HGLOBAL hg = LoadResource(hMod, hr);
@@ -197,15 +218,35 @@ static BOOL CALLBACK EnumResNameProc(HMODULE hMod, LPCSTR type, LPSTR name, LONG
 static void EnumerateEmbeddedShaders()
 {
     HMODULE hMod = GetModuleHandleA(nullptr);
-    // RCDATA type = RT_RCDATA = 10
     EnumResourceNamesA(hMod, RT_RCDATA, EnumResNameProc, 0);
+}
+
+// xorshift32 PRNG, seeded from QPC + tick + PID for genuine entropy
+static DWORD g_rngState = 0;
+static DWORD XorshiftNext()
+{
+    DWORD x = g_rngState;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_rngState = x ? x : 0x9E3779B9u;
+    return g_rngState;
+}
+static void SeedRng()
+{
+    LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+    DWORD seed = (DWORD)qpc.QuadPart ^ (DWORD)(qpc.QuadPart >> 32)
+               ^ GetTickCount() ^ GetCurrentProcessId();
+    g_rngState = seed ? seed : 0xDEADBEEFu;
+    for (int i = 0; i < 8; ++i) XorshiftNext();
 }
 
 // Returns heap-allocated null-terminated copy of a random embedded shader, or nullptr
 static char* PickEmbeddedShader()
 {
     if (g_resCount == 0) return nullptr;
-    int pick = (int)(GetTickCount() % (DWORD)g_resCount);
+    SeedRng();
+    int pick = (int)(XorshiftNext() % (DWORD)g_resCount);
     DWORD sz = g_resShaders[pick].size;
     char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, sz + 1);
     for (DWORD i = 0; i < sz; ++i) buf[i] = g_resShaders[pick].data[i];
@@ -312,10 +353,80 @@ static char* InjectCulling(const char* fragSrc)
     return out;
 }
 
+// Inject primary-monitor-only confinement: remap gl_FragCoord and black out pixels outside primary
+static char* InjectPrimaryOnly(const char* fragSrc)
+{
+    const char* uniformInsert = fragSrc;
+    const char* scan = fragSrc;
+    while (*scan) {
+        if (*scan == '#' || (scan == fragSrc || *(scan-1) == '\n')) {
+            bool isDirective = (*scan == '#');
+            bool isPrec = (strncmp(scan, "precision", 9) == 0);
+            if (isDirective || isPrec) {
+                while (*scan && *scan != '\n') scan++;
+                if (*scan == '\n') scan++;
+                uniformInsert = scan;
+                continue;
+            }
+        }
+        while (*scan && *scan != '\n') scan++;
+        if (*scan == '\n') scan++;
+        break;
+    }
+
+    const char* mainPos = strstr(fragSrc, "void main()");
+    if (!mainPos) mainPos = strstr(fragSrc, "void main ()");
+    if (!mainPos) mainPos = strstr(fragSrc, "void main(");
+    if (!mainPos) return nullptr;
+
+    const char* brace = strchr(mainPos, '{');
+    if (!brace) return nullptr;
+    brace++;
+
+    // gl_FragCoord here is already remapped to primary-local by the macro.
+    // Out-of-primary if local coord < 0 or >= (primMax - primMin).
+    const char* primCheck = "\n"
+        "    {\n"
+        "      vec2 _sz = _primRect.zw - _primRect.xy;\n"
+        "      if (gl_FragCoord.x < 0.0 || gl_FragCoord.x >= _sz.x ||\n"
+        "          gl_FragCoord.y < 0.0 || gl_FragCoord.y >= _sz.y)\n"
+        "        { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }\n"
+        "    }\n";
+
+    int prefixLen = lstrlenA(kPrimPrefix);
+    int checkLen  = lstrlenA(primCheck);
+    int srcLen    = lstrlenA(fragSrc);
+    int outLen    = srcLen + prefixLen + checkLen + 16;
+
+    char* out = (char*)HeapAlloc(GetProcessHeap(), 0, outLen);
+    char* w = out;
+
+    int uOff = (int)(uniformInsert - fragSrc);
+    for (int i = 0; i < uOff; ++i) *w++ = fragSrc[i];
+
+    const char* s = kPrimPrefix;
+    while (*s) *w++ = *s++;
+
+    int bOff = (int)(brace - fragSrc);
+    for (int i = uOff; i < bOff; ++i) *w++ = fragSrc[i];
+
+    s = primCheck;
+    while (*s) *w++ = *s++;
+
+    const char* rest = brace;
+    while (*rest) *w++ = *rest++;
+    *w = '\0';
+
+    return out;
+}
+
 static bool BuildProgram(const char* fragSrc)
 {
     char* cullSrc = nullptr;
-    if (g_needsCulling) {
+    if (g_primaryOnly) {
+        cullSrc = InjectPrimaryOnly(fragSrc);
+        if (cullSrc) fragSrc = cullSrc;
+    } else if (g_needsCulling) {
         cullSrc = InjectCulling(fragSrc);
         if (cullSrc) fragSrc = cullSrc;
     }
@@ -354,6 +465,7 @@ static bool BuildProgram(const char* fragSrc)
     // Monitor culling uniforms
     g_uMonCount    = glGetUniformLocation(g_prog, "_monCount");
     g_uMonRects    = glGetUniformLocation(g_prog, "_monRects");
+    g_uPrimRect    = glGetUniformLocation(g_prog, "_primRect");
 
     return true;
 }
@@ -419,25 +531,41 @@ static bool InitGL(HWND hwnd, const char* fragSrcIn)
     LOAD_GL(PFNGLGETPROGRAMINFOLOGPROC,  glGetProgramInfoLog);
 
     // 4. Compile the shader source (already in memory)
-    // Detect if shader has its own clock (uses iDate)
+    // Detect if shader has its own clock (uses iDate) — confine to primary monitor
     g_shaderHasClock = (strstr(fragSrcIn, "iDate") != nullptr);
+    g_primaryOnly = g_shaderHasClock;
     bool ok = BuildProgram(fragSrcIn);
     return ok;
 }
+
+// Shader time pause state — when true, Render() uses g_pauseBeganAtMs as the
+// clock so t is frozen. On unpause, g_startMs is advanced by the pause
+// duration so t resumes seamlessly.
+static bool  g_shaderPaused   = false;
+static DWORD g_pauseBeganAtMs = 0;
 
 static void Render()
 {
     glViewport(0, 0, g_w, g_h);
     glUseProgram(g_prog);
 
-    float t  = (float)(GetTickCount() - g_startMs) / 1000.0f;
+    DWORD nowMs = g_shaderPaused ? g_pauseBeganAtMs : GetTickCount();
+    float t  = (float)(nowMs - g_startMs) / 1000.0f;
     float mx = g_mx * g_w, my = g_my * g_h;
 
+    // In primary-only mode, the shader's coordinate space is the primary monitor
+    // (gl_FragCoord is remapped via macro and iResolution should match).
+    float resW = (float)g_w, resH = (float)g_h;
+    if (g_primaryOnly) {
+        resW = g_primGL[2] - g_primGL[0];
+        resH = g_primGL[3] - g_primGL[1];
+    }
+
     if (g_uTime       != -1) glUniform1f(g_uTime,        t);
-    if (g_uResolution != -1) glUniform2f(g_uResolution,  (float)g_w, (float)g_h);
+    if (g_uResolution != -1) glUniform2f(g_uResolution,  resW, resH);
     if (g_uMouse      != -1) glUniform2f(g_uMouse,       mx, my);
     if (g_uITime      != -1) glUniform1f(g_uITime,       t);
-    if (g_uIResolution!= -1) glUniform3f(g_uIResolution, (float)g_w, (float)g_h, 1.0f);
+    if (g_uIResolution!= -1) glUniform3f(g_uIResolution, resW, resH, 1.0f);
     if (g_uIMouse     != -1) glUniform4f(g_uIMouse,      mx, my, 0.0f, 0.0f);
     if (g_uITimeDelta != -1) glUniform1f(g_uITimeDelta,  0.016f);
     if (g_uIFrame     != -1) glUniform1i(g_uIFrame,      (int)(t * 60.0f));
@@ -451,6 +579,7 @@ static void Render()
     // Monitor culling uniforms (only set if injection is active)
     if (g_uMonCount   != -1) glUniform1i(g_uMonCount,    g_monCount);
     if (g_uMonRects   != -1) glUniform4fv(g_uMonRects,   g_monCount, g_monGL);
+    if (g_uPrimRect   != -1) glUniform4f(g_uPrimRect,    g_primGL[0], g_primGL[1], g_primGL[2], g_primGL[3]);
 
     // Draw fullscreen quad (4 vertices, no VBO needed with gl_VertexID trick)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -463,6 +592,9 @@ static void Render()
 // ---------------------------------------------------------------------------
 
 static HWND g_clockWnd = nullptr;
+
+// Forward declaration (defined after ClockWndProc)
+static void BeginFadeOut(HWND mainWnd);
 
 // Persistent clock GDI resources — created once, reused every tick
 static const int CW = 600, CH = 170;
@@ -578,12 +710,19 @@ static void DrawClock(HWND hwnd)
     ClockDrawText(dateBuf, g_clockDateFont, 4, 98, 0x99000000);
     ClockDrawText(dateBuf, g_clockDateFont, 2, 96, 0xFFFFFFFF);
 
+    // Hold invisible for 5s after shader start, then fade in over 1s.
+    DWORD elapsed = GetTickCount() - g_startMs;
+    BYTE constAlpha;
+    if (elapsed < 5000)      constAlpha = 0;
+    else if (elapsed < 6000) constAlpha = (BYTE)((elapsed - 5000) * 255 / 1000);
+    else                     constAlpha = 255;
+
     POINT ptSrc = {0, 0};
     SIZE  szWnd = {CW, CH};
     POINT ptDst = {winX, winY};
     BLENDFUNCTION bf = {};
     bf.BlendOp             = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 255;
+    bf.SourceConstantAlpha = constAlpha;
     bf.AlphaFormat         = AC_SRC_ALPHA;
 
     SetWindowPos(hwnd, nullptr, winX, winY, CW, CH, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -595,12 +734,19 @@ LRESULT CALLBACK ClockWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_TIMER:
         DrawClock(hwnd);
+        // Once fade-in is complete, drop to 1s timer for normal minute-tick updates
+        if (GetTickCount() - g_startMs >= 6000) {
+            SetTimer(hwnd, 1, 1000, nullptr);
+        }
         return 0;
     // Forward quit keys to main window
     case WM_KEYDOWN:
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
-        if (g_clockWnd) DestroyWindow(GetParent(hwnd));
+        if (g_clockWnd) BeginFadeOut(GetParent(hwnd));
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, 1);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -625,7 +771,167 @@ static void CreateClockWindow(HINSTANCE hInst, HWND parent)
     );
 
     DrawClock(g_clockWnd);
-    SetTimer(g_clockWnd, 1, 1000, nullptr);
+    // Fast tick (50ms) during the 5s hold + 1s fade-in so the fade is smooth.
+    // ClockWndProc switches to 1s once the fade-in is complete.
+    SetTimer(g_clockWnd, 1, 50, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Desktop fade overlay — captures the screen at startup and fades out over
+// the shader. Layered + transparent so it doesn't steal input.
+// On dismiss, the same DIB is reused to fade BACK to the desktop snapshot.
+// ---------------------------------------------------------------------------
+static HWND   g_fadeWnd       = nullptr;
+static HBITMAP g_fadeBmp      = nullptr;
+static HDC    g_fadeMemDC     = nullptr;
+static int    g_fadeW = 0, g_fadeH = 0;
+static int    g_fadeVx = 0, g_fadeVy = 0;
+static HINSTANCE g_fadeHInst  = nullptr;
+static DWORD  g_fadeStartMs   = 0;
+static const DWORD kFadeDurationMs = 350;
+static int    g_fadeHoldFrames = 0;
+
+// Fade-out state (dismissal). When true, alpha animates 0→255 over the snapshot.
+static bool   g_fadingOut     = false;
+static DWORD  g_fadeOutStartMs = 0;
+static const DWORD kFadeOutDurationMs = 300;
+
+// Smoothstep easing: x in [0,1] → eased value in [0,1] with zero derivative
+// at the endpoints. Concentrates change in the middle of the curve, making
+// the visible alpha steps in the bright/dim tails imperceptible.
+static float SmoothstepF(float x)
+{
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    return x * x * (3.0f - 2.0f * x);
+}
+static HWND   g_mainWnd       = nullptr; // shader window, destroyed after fade-out
+
+static LRESULT CALLBACK FadeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (g_fadeMemDC) BitBlt(dc, 0, 0, g_fadeW, g_fadeH, g_fadeMemDC, 0, 0, SRCCOPY);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void CaptureDesktopAndCreateOverlay(BYTE startAlpha)
+{
+    g_fadeWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+        L"ShaderFadeOverlay", L"",
+        WS_POPUP,
+        g_fadeVx, g_fadeVy, g_fadeW, g_fadeH,
+        nullptr, nullptr, g_fadeHInst, nullptr
+    );
+    if (!g_fadeWnd) return;
+    SetLayeredWindowAttributes(g_fadeWnd, 0, startAlpha, LWA_ALPHA);
+    ShowWindow(g_fadeWnd, SW_SHOW);
+}
+
+static void CreateFadeOverlay(HINSTANCE hInst, int vx, int vy, int vw, int vh)
+{
+    g_fadeHInst = hInst;
+    g_fadeVx = vx; g_fadeVy = vy;
+    g_fadeW = vw;  g_fadeH = vh;
+
+    // Capture the virtual desktop into a DIB (kept alive for the fade-out too).
+    HDC screenDC = GetDC(nullptr);
+    g_fadeMemDC = CreateCompatibleDC(screenDC);
+    g_fadeBmp = CreateCompatibleBitmap(screenDC, vw, vh);
+    SelectObject(g_fadeMemDC, g_fadeBmp);
+    BitBlt(g_fadeMemDC, 0, 0, vw, vh, screenDC, vx, vy, SRCCOPY);
+    ReleaseDC(nullptr, screenDC);
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = FadeWndProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = L"ShaderFadeOverlay";
+    wc.hbrBackground = nullptr;
+    RegisterClassExW(&wc);
+
+    CaptureDesktopAndCreateOverlay(255);
+    UpdateWindow(g_fadeWnd); // force the desktop snapshot to paint before the shader appears
+    g_fadeStartMs = GetTickCount();
+}
+
+static void FreeFadeBitmap()
+{
+    if (g_fadeMemDC) { DeleteDC(g_fadeMemDC); g_fadeMemDC = nullptr; }
+    if (g_fadeBmp)   { DeleteObject(g_fadeBmp); g_fadeBmp = nullptr; }
+}
+
+// Begin fade-out: recreate overlay (DIB still alive) and animate 0→255 alpha.
+// When the animation is done, the shader window is destroyed and the app exits.
+static void BeginFadeOut(HWND mainWnd)
+{
+    if (g_fadingOut) return;
+    g_fadingOut = true;
+    g_mainWnd = mainWnd;
+    g_fadeOutStartMs = GetTickCount();
+
+    // Freeze the shader so the snapshot dissolves over a stable last frame.
+    if (!g_shaderPaused) {
+        g_shaderPaused = true;
+        g_pauseBeganAtMs = GetTickCount();
+    }
+
+    // Recreate overlay if it isn't around (startup fade already destroyed it).
+    if (!g_fadeWnd && g_fadeMemDC) {
+        CaptureDesktopAndCreateOverlay(0);
+    } else if (g_fadeWnd) {
+        // Startup fade may still be visible — re-anchor to current alpha.
+        SetLayeredWindowAttributes(g_fadeWnd, 0, 0, LWA_ALPHA);
+    }
+}
+
+// Returns true while a fade is still running. Animates startup fade-in
+// (alpha 255→0) and dismissal fade-out (alpha 0→255).
+static bool TickFadeOverlay()
+{
+    if (g_fadingOut) {
+        if (!g_fadeWnd) return false;
+        DWORD elapsed = GetTickCount() - g_fadeOutStartMs;
+        if (elapsed >= kFadeOutDurationMs) {
+            SetLayeredWindowAttributes(g_fadeWnd, 0, 255, LWA_ALPHA);
+            // Hold full opacity for a couple frames so the snapshot is on screen
+            // before the shader window is torn down underneath it.
+            if (++g_fadeHoldFrames >= 4) {
+                if (g_mainWnd) { DestroyWindow(g_mainWnd); g_mainWnd = nullptr; }
+            }
+            return true;
+        }
+        float p = (float)elapsed / (float)kFadeOutDurationMs;
+        BYTE alpha = (BYTE)(SmoothstepF(p) * 255.0f + 0.5f);
+        SetLayeredWindowAttributes(g_fadeWnd, 0, alpha, LWA_ALPHA);
+        return true;
+    }
+
+    // Startup fade-in: alpha 255 → 0, then destroy overlay (DIB stays alive).
+    if (!g_fadeWnd) return false;
+    DWORD elapsed = GetTickCount() - g_fadeStartMs;
+    if (elapsed >= kFadeDurationMs) {
+        SetLayeredWindowAttributes(g_fadeWnd, 0, 0, LWA_ALPHA);
+        if (++g_fadeHoldFrames >= 4) {
+            DestroyWindow(g_fadeWnd);
+            g_fadeWnd = nullptr;
+            g_fadeHoldFrames = 0;
+            return false;
+        }
+        return true;
+    }
+    float p = (float)elapsed / (float)kFadeDurationMs;
+    BYTE alpha = (BYTE)((1.0f - SmoothstepF(p)) * 255.0f + 0.5f);
+    SetLayeredWindowAttributes(g_fadeWnd, 0, alpha, LWA_ALPHA);
+    return true;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -656,10 +962,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
-        DestroyWindow(hwnd);
+        BeginFadeOut(hwnd);
         return 0;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) DestroyWindow(hwnd);
+    case WM_SYSKEYDOWN:
+        BeginFadeOut(hwnd);
         return 0;
 
     case WM_DESTROY:
@@ -710,6 +1017,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // ---------------------------------------------------------------------------
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
+        // If the argument is an existing file, treat it as a shader path (not a flag)
+        if (GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES) continue;
         if (*a == '/' || *a == '-') a++;
         char ch = a[0] | 0x20; // lowercase
         // /lock — lock workstation when shader is dismissed
@@ -740,6 +1049,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     const char* diskShaderPath = nullptr;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
+        // An existing file is always treated as a shader path
+        if (GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES) { diskShaderPath = a; break; }
         if (*a != '/' && *a != '-') { diskShaderPath = a; break; }
     }
 
@@ -771,7 +1082,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     EnumerateMonitors();
-    if (g_needsCulling) BuildMonitorGLRects(vx, vy, vw, vh);
+    BuildMonitorGLRects(vx, vy, vw, vh);
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
 
@@ -788,14 +1099,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     HWND hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         L"GreenOverlay", L"",
-        WS_POPUP | WS_VISIBLE,
+        WS_POPUP,
         vx, vy, vw, vh,
         nullptr, nullptr, hInst, nullptr
     );
 
     g_w = vw;
     g_h = vh;
-    g_startMs = GetTickCount();
 
     if (!InitGL(hwnd, fragSrc)) return 1;
     HeapFree(GetProcessHeap(), 0, fragSrc);
@@ -805,17 +1115,42 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // Move mouse to bottom of screen
     SetCursorPos(vx + vw / 2, vy + vh - 1);
 
-    // Active render loop — render every frame, dispatch queued messages
+    // Set t=0 reference here, just before the first frame is drawn —
+    // doing this earlier counts shader compile + window setup time as t > 0,
+    // making motion look like it skipped ahead by the time the user sees it.
+    g_startMs = GetTickCount();
+    // Render first frame offscreen so the window appears with shader content
+    Render();
+
+    // Create fade overlay BEFORE showing shader window, so the desktop snapshot
+    // is captured cleanly. Overlay is created after shader window so it sits on top.
+    CreateFadeOverlay(hInst, vx, vy, vw, vh);
+
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    // Re-assert overlay z-order in case ShowWindow on shader bumped it.
+    if (g_fadeWnd) SetWindowPos(g_fadeWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    // Active render loop — render every other frame, dispatch queued messages
     MSG msg = {};
+    int frameNum = 0;
     for (;;) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) goto done;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        Render();
+        // Render even while paused — shader needs to keep refreshing the window
+        // so DWM has live content underneath the fade overlay. Time is frozen
+        // via g_startMs adjustment, so the visual stays static.
+        if (++frameNum & 1) Render();
+        else Sleep(1);
+        TickFadeOverlay();
     }
 done:
+    if (g_fadeWnd) { DestroyWindow(g_fadeWnd); g_fadeWnd = nullptr; }
+    FreeFadeBitmap();
     FreeClockGDI();
     if (g_clockWnd) { DestroyWindow(g_clockWnd); g_clockWnd = nullptr; }
     if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = nullptr; }
