@@ -3,14 +3,17 @@
 # <div align="center">AVS Shader Screensaver</div>
 
 <div align="center">
-<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>46 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
+<h3>A portable OpenGL screensaver for Windows that randomly picks from <b>23 curated GLSL fragment shaders</b> embedded directly in the executable. No external files needed — a single <code>.exe</code> (or <code>.scr</code>) contains everything.</h3>
 </div>
 
 ---
 
 ## Features
 
-- **46 embedded GLSL shaders** — fractals, terrain, aurora, oceans, fire, clocks, cyberpunk cityscapes, glass refraction, fireworks and more
+- **23 embedded GLSL shaders** — fractals, terrain, oceans, fire, clocks, alien water, tunnels, galaxies, ripples and more. Additional heavyweight shaders (aurora, mountain, zion, frostedforest, waveform, flower, star) are stashed in `heavy/` and can be embedded by moving them up one level before building
+- **Exit transitions** — when the user dismisses the screensaver, the host snapshots the current desktop, uploads it as a texture, and runs a GPU crossfade between the live shader frame and the desktop using one of the embedded `exit-*.glsl` shaders (e.g. `exit-05-perlin`, `exit-12-crosswarp`). Each variant has its own duration (perlin 0.8s, crosswarp 0.9s, crossfade 0.35s, default 0.5s) looked up from the resource name. Direction alternates between shader→desktop and desktop→shader. With no `exit-*` resources embedded, the host falls back to instant exit
+- **`/lock` flag** — when launched with `shader.exe /lock`, the workstation is locked the moment the user dismisses the screensaver (mouse/keyboard). The mutex is released before `LockWorkStation()` so the lock screen can immediately spawn its own instance
+- **Install / uninstall scripts** — `install.bat` copies `shader.scr` to `System32`, registers it as the active screensaver for the current user *and* for the lock screen desktop (`HKU\.DEFAULT`). `uninstall.bat` reverses both
 - **Fully portable** — all shaders are bundled as PE resources inside the executable. Copy it anywhere and run
 - **Multi-monitor support** — renders across all monitors using the virtual screen dimensions
 - **Dead-zone culling** — automatically detects mismatched monitor layouts (different resolutions/orientations) and injects per-pixel monitor bounds checking into every shader at runtime. Pixels in the gaps between monitors are skipped via early-return, saving GPU cycles on non-rectangular multi-monitor setups
@@ -32,10 +35,11 @@ shader.exe terrain.glsl       # Run a specific shader from disk
 
 ### As a screensaver
 
-1. Build the project (see below)
-2. Rename `shader.exe` to `shader.scr`, or use the auto-generated copy from `build.bat`
-3. Right-click `shader.scr` → **Install**, or copy to `C:\Windows\System32`
-4. Select in **Screen Saver Settings**
+1. Build the project (see below) — `build.bat` produces both `shader.exe` and `shader.scr`
+2. Run `install.bat` (as Administrator) to copy `shader.scr` into `System32` and register it as the active screensaver for both the desktop session and the lock screen
+3. Run `uninstall.bat` to remove it
+
+Or do it manually: right-click `shader.scr` → **Install**, or copy to `C:\Windows\System32` and pick it from **Screen Saver Settings**.
 
 ## Build
 
@@ -99,28 +103,23 @@ This injection is **automatic and transparent** — no shader modification neede
 
 | Shader | Author | License |
 |--------|--------|---------|
-| aurora.glsl | nimitz 2017 (@stormoid) | CC BY-NC-SA 3.0 |
-| cob.glsl | Kabuto, based on @ahnqqq | — |
-| frostedforest.glsl | eiffie | — |
-| gamma.glsl | @XorDev | — |
-| glasscube.glsl | Danil (github.com/danilw) | CC BY-NC-SA 3.0 |
-| heaven.glsl | @XorDev | — |
 | matrix.glsl | FabriceNeyret2, otaviogood | — |
-| mountain.glsl | Alexander Alekseev (TDM) 2014 | CC BY-NC-SA 3.0 |
 | sea.glsl | Alexander Alekseev (TDM) 2014 | CC BY-NC-SA 3.0 |
+| seascape.glsl | Alexander Alekseev (TDM) 2014 | CC BY-NC-SA 3.0 |
 | sinus.glsl | Green120 | — |
-| sunset.glsl | srvstr 2025 | MIT |
 | terrain.glsl | Inigo Quilez 2014 | — |
-| tracks.glsl | Cole Peterson (Plento) | — |
-| tron.glsl | — | — |
-| universe.glsl | Martijn Steinrucken (BigWings) 2018 | CC BY-NC-SA 3.0 |
-| vorofire.glsl | — | — |
 | warp.glsl | Inigo Quilez 2013 | — |
-| wasteland.glsl | Dave Hoskins, nimitz (@stormoid) | CC BY-NC-SA 3.0 |
-| waveform.glsl | @XorDev | — |
-| woods.glsl | dr2 2018 | CC BY-NC-SA 3.0 |
-| zion.glsl | dean_the_coder (@deanthecoder) | CC BY-NC-SA 3.0 |
 | 7seg.glsl | Based on cmarangu | — |
+
+Shaders in `heavy/` (not embedded by default):
+
+| Shader | Author | License |
+|--------|--------|---------|
+| aurora.glsl | nimitz 2017 (@stormoid) | CC BY-NC-SA 3.0 |
+| frostedforest.glsl | eiffie | — |
+| mountain.glsl | Alexander Alekseev (TDM) 2014 | CC BY-NC-SA 3.0 |
+| waveform.glsl | @XorDev | — |
+| zion.glsl | dean_the_coder (@deanthecoder) | CC BY-NC-SA 3.0 |
 
 Remaining shaders are twigl.app conversions, Shadertoy ports, or original compositions without embedded attribution.
 
@@ -133,5 +132,5 @@ The icon (`commodorevic20.ico`) is included for personal/non-commercial use.
 ---
 
 **psychip.net**
-April 2026  
+May 2026  
 

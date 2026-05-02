@@ -439,7 +439,13 @@ void mainImage(out vec4 fragColor, vec2 fragCoord) {
 }
 
 void main() {
+  // Scanline skip: every other column black, saves 50% GPU
+  vec2 fc = gl_FragCoord.xy;
+  if (mod(floor(fc.x), 2.0) < 1.0) {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
   vec4 c;
-  mainImage(c, gl_FragCoord.xy);
+  mainImage(c, fc);
   gl_FragColor = c;
 }

@@ -44,7 +44,7 @@ REM Compile resource file
 rc /nologo shaders.rc
 
 REM Compile and link with embedded resources
-cl /O1 /GS- /GF shader.cpp shaders.res /link /OPT:REF /OPT:ICF user32.lib gdi32.lib opengl32.lib kernel32.lib ole32.lib /subsystem:windows /out:shader.exe
+cl /O1 /GS- /GF shader.cpp shaders.res /link /OPT:REF /OPT:ICF user32.lib gdi32.lib opengl32.lib kernel32.lib /subsystem:windows /out:shader.exe
 
 del *.obj 2>nul
 del shaders.res 2>nul
